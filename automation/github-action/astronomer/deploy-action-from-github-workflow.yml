@@ -1,0 +1,85 @@
+name: deployments_push
+on:
+  push:
+    branches:
+      - main
+      - test
+jobs:
+  code-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name }}
+    steps:
+    - name: Check out the repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event.after }}
+        clean: false
+    - name: Get Deployment Type
+      run: |
+        cd ./
+        branch=$(echo "${GITHUB_REF#refs/heads/}")
+        echo "Branch pushed to: $branch"
+        git fetch origin $branch
+        files=$(git diff --name-only ${{ github.event.before }} ${{ github.event.after }})
+        echo "files changed: $files"
+        dags_only=1
+    
+        for file in $files; do
+          if [[ $file != *"dags/"* ]]; then
+            echo $file is not a DAG, triggering a full image build
+            dags_only=0
+            break
+          fi
+        done
+
+        echo "DAGS_ONLY=$dags_only" >> $GITHUB_OUTPUT
+      shell: bash
+      id: deployment-type
+
+      # If any other files changed, deploy the entire Astro project
+    - name: Log in to registry
+      if: steps.deployment-type.outputs.DAGS_ONLY == 0
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ vars.REGISTRY }}
+        username: ${{ secrets.REGISTRY_USR }}
+        password: ${{ secrets.REGISTRY_PASS }}
+  
+    - name: Build image
+      if: steps.deployment-type.outputs.DAGS_ONLY == 0
+      run: echo '\ndags/' >> .dockerignore && docker build -t ${{ vars.REGISTRY }}/${{ vars.RELEASE_NAME }}/airflow:${{ github.sha }} .
+      shell: bash
+    
+    - name: Push image
+      if: steps.deployment-type.outputs.DAGS_ONLY == 0
+      run: docker push ${{ vars.REGISTRY }}/${{ vars.RELEASE_NAME }}/airflow:${{ github.sha }}
+      shell: bash
+
+    - name: Get Runtime Version
+      if: steps.deployment-type.outputs.DAGS_ONLY == 0
+      run: echo "RUNTIME_VERSION=$(docker inspect --format='{{ index .Config.Labels "io.astronomer.docker.runtime.version" }}' ${{ vars.REGISTRY }}/${{ vars.RELEASE_NAME }}/airflow:${{ github.sha }})" >> $GITHUB_OUTPUT
+      shell: bash
+      id: get-rt-version
+
+    - name: Update Deployment
+      if: steps.deployment-type.outputs.DAGS_ONLY == 0
+      run: |
+        IMAGE_DEPLOY=$(curl "https://houston.${{ vars.BASE_DOMAIN }}/v1" \
+        -H "Accept-Encoding: gzip, deflate, br" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -H "Connection: keep-alive" \
+        -H "DNT: 1" \
+        -H "Origin: https://houston.${{ vars.BASE_DOMAIN }}/v1" \
+        -H "Authorization: ${{ secrets.SERVICE_ACCOUNT_TOKEN }}" \
+        --data-binary "{\"query\":\"mutation updateDeploymentImage {updateDeploymentImage(releaseName: \\\"${{ vars.RELEASE_NAME }}\\\", image: \\\"${{ vars.REGISTRY }}/${{ vars.RELEASE_NAME }}/airflow:${{ github.sha }}\\\", runtimeVersion: \\\"${{ steps.get-rt-version.outputs.RUNTIME_VERSION }}\\\"){id}}\"}" \
+        --compressed) && jq -e 'has("errors") | not' <<< "$IMAGE_DEPLOY"
+      shell: bash
+
+    - name: DAG Deploy to Astro
+      run: |
+        tar -czf dags.tgz dags
+        curl --location 'https://deployments.${{ vars.BASE_DOMAIN }}/${{ vars.RELEASE_NAME }}/dags/upload' --header 'Authorization: Bearer ${{ secrets.SERVICE_ACCOUNT_TOKEN }}' --form 'dags.tar.gz=@dags.tgz'
+      shell: bash
